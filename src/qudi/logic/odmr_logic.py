@@ -674,7 +674,9 @@ class OdmrLogic(LogicBase):
     @QtCore.Slot(str, str, int)
     def do_fit(self, fit_config, channel, range_index):
         """
-        Execute the currently configured fit on the measurement data. Optionally on passed data
+        Führt den aktuellen Fit auf den Messdaten aus.
+        Nach erfolgreichem Fit wird eine adaptive Verfeinerung des
+        Frequenzbereichs (im Drop-Bereich) durchgeführt.
         """
         if fit_config != 'No Fit' and fit_config not in self._fit_config_model.configuration_names:
             self.log.error(f'Unknown fit configuration "{fit_config}" encountered.')
@@ -685,15 +687,57 @@ class OdmrLogic(LogicBase):
 
         try:
             fit_config, fit_result = self._fit_container.fit_data(fit_config, x_data, y_data)
-        except:
+        except Exception as e:
             self.log.exception('Data fitting failed:')
             return
 
         if fit_result is not None:
             self._fit_results[channel][range_index] = (fit_config, fit_result)
+            # Adaptive Verfeinerung des Frequenzbereichs, um den Dip genauer abzutasten:
+            self._adaptive_update_frequency_range(channel, range_index, fit_result)
         else:
             self._fit_results[channel][range_index] = None
+
         self.sigFitUpdated.emit(self._fit_results[channel][range_index], channel, range_index)
+
+    def _adaptive_update_frequency_range(self, channel, range_index, fit_result):
+        """
+        Passt adaptiv den Frequenzbereich an, basierend auf den Fit-Ergebnissen,
+        um im Drop-Bereich eine höhere Messpunktdichte zu erreichen.
+        
+        Erwartet wird, dass 'fit_result.parameters' ein Dictionary enthält,
+        in dem mindestens 'center' (Dip-Mittelpunkt) und 'sigma' (Breite des Dips)
+        definiert sind.
+        
+        Beispielhafter Algorithmus:
+        - Bestimme den neuen Frequenzbereich als ±3·sigma um den Dip-Mittelpunkt.
+        - Verdopple die Anzahl der Messpunkte im betreffenden Bereich.
+        """
+        try:
+            # Extrahiere Fit-Parameter (diese Schlüssel können je nach Fit-Modell variieren)
+            params = fit_result.parameters
+            dip_center = params.get('center', None)
+            dip_width = params.get('sigma', None)
+            if dip_center is None or dip_width is None:
+                self.log.warning("Fit-Ergebnis enthält nicht die nötigen Parameter 'center' und 'sigma'. Adaptive Verfeinerung wird übersprungen.")
+                return
+
+            # Definiere den neuen Frequenzbereich: ±3·sigma um den Dip-Mittelpunkt
+            new_start = dip_center - 3 * dip_width
+            new_stop = dip_center + 3 * dip_width
+
+            # Erhöhe die Anzahl der Messpunkte (z. B. Verdopplung)
+            current_points = self._scan_frequency_ranges[range_index][2]
+            new_points = current_points * 2
+
+            self.log.info(f"Adaptive Verfeinerung: Frequenzbereich {self._scan_frequency_ranges[range_index]} wird zu ({new_start}, {new_stop}, {new_points}) angepasst.")
+
+            # Aktualisiere den Frequenzbereich und das zugehörige Frequenzarray
+            self._scan_frequency_ranges[range_index] = (new_start, new_stop, new_points)
+            self._frequency_data[range_index] = np.linspace(new_start, new_stop, new_points)
+        except Exception as e:
+            self.log.exception("Fehler bei der adaptiven Aktualisierung des Frequenzbereichs:")
+
 
     def _get_metadata(self):
         metadata = {'Microwave CW Power (dBm)': self._cw_power,
