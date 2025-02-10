@@ -679,7 +679,7 @@ class OdmrLogic(LogicBase):
         Nach erfolgreichem Fit wird eine adaptive Verfeinerung des
         Frequenzbereichs (im Drop-Bereich) durchgeführt.
         """
-        # Neuer, besonderer Log-Eintrag:
+        # Besondere Log-Ausgabe, um den Aufruf zu markieren:
         self.log.info("SPECIAL_LOG: do_fit triggered with fit_config='{}', channel='{}', range_index={}".format(fit_config, channel, range_index))
 
         if fit_config != 'No Fit' and fit_config not in self._fit_config_model.configuration_names:
@@ -697,51 +697,51 @@ class OdmrLogic(LogicBase):
 
         if fit_result is not None:
             self._fit_results[channel][range_index] = (fit_config, fit_result)
-            # Adaptive Verfeinerung des Frequenzbereichs, um den Dip genauer abzutasten:
+            # Adaptive Verfeinerung des Frequenzbereichs, um den Dip (Drop) genauer abzutasten:
             self._adaptive_update_frequency_range(channel, range_index, fit_result)
         else:
             self._fit_results[channel][range_index] = None
 
         self.sigFitUpdated.emit(self._fit_results[channel][range_index], channel, range_index)
 
-
     def _adaptive_update_frequency_range(self, channel, range_index, fit_result):
         """
         Passt adaptiv den Frequenzbereich an, basierend auf den Fit-Ergebnissen,
-        um im Drop-Bereich eine höhere Messpunktdichte zu erreichen.
+        um im Drop-Bereich (Resonanz) eine höhere Messpunktdichte zu erreichen.
         
         Erwartet wird, dass 'fit_result.parameters' ein Dictionary enthält,
         in dem mindestens 'center' (Dip-Mittelpunkt) und 'sigma' (Breite des Dips)
         definiert sind.
         
-        Beispielhafter Algorithmus:
-        - Bestimme den neuen Frequenzbereich als ±3·sigma um den Dip-Mittelpunkt.
-        - Verdopple die Anzahl der Messpunkte im betreffenden Bereich.
+        Zur deutlicheren Darstellung wird der neue Frequenzbereich:
+        - auf ±1·sigma um den Dip-Mittelpunkt gesetzt,
+        - die Anzahl der Messpunkte wird um den Faktor 3 erhöht.
         """
         try:
-            # Extrahiere Fit-Parameter (diese Schlüssel können je nach Fit-Modell variieren)
             params = fit_result.parameters
             dip_center = params.get('center', None)
             dip_width = params.get('sigma', None)
             if dip_center is None or dip_width is None:
-                self.log.warning("Fit-Ergebnis enthält nicht die nötigen Parameter 'center' und 'sigma'. Adaptive Verfeinerung wird übersprungen.")
+                self.log.warning("SPECIAL_LOG: Fit result missing 'center' and/or 'sigma'. Skipping adaptive update.")
                 return
 
-            # Definiere den neuen Frequenzbereich: ±3·sigma um den Dip-Mittelpunkt
-            new_start = dip_center - 3 * dip_width
-            new_stop = dip_center + 3 * dip_width
+            # Für einen deutlichen Unterschied: setze den neuen Bereich auf ±1·sigma
+            new_start = dip_center - dip_width
+            new_stop = dip_center + dip_width
 
-            # Erhöhe die Anzahl der Messpunkte (z. B. Verdopplung)
+            # Verdopple nicht mehr, sondern verdreifache die Anzahl der Punkte:
             current_points = self._scan_frequency_ranges[range_index][2]
-            new_points = current_points * 2
+            new_points = current_points * 3
 
-            self.log.info(f"Adaptive Verfeinerung: Frequenzbereich {self._scan_frequency_ranges[range_index]} wird zu ({new_start}, {new_stop}, {new_points}) angepasst.")
+            self.log.info("SPECIAL_LOG: Adaptive update applied. Changing frequency range from {} to ({}, {}, {}).".format(
+                self._scan_frequency_ranges[range_index], new_start, new_stop, new_points
+            ))
 
-            # Aktualisiere den Frequenzbereich und das zugehörige Frequenzarray
+            # Aktualisiere den Frequenzbereich und das Frequenzarray
             self._scan_frequency_ranges[range_index] = (new_start, new_stop, new_points)
             self._frequency_data[range_index] = np.linspace(new_start, new_stop, new_points)
         except Exception as e:
-            self.log.exception("Fehler bei der adaptiven Aktualisierung des Frequenzbereichs:")
+            self.log.exception("SPECIAL_LOG: Error in adaptive update:")
 
 
     def _get_metadata(self):
