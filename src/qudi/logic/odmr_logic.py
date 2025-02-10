@@ -671,6 +671,7 @@ class OdmrLogic(LogicBase):
                 self._sigNextLine.emit()
             return
 
+
     @QtCore.Slot(str, str, int)
     def do_fit(self, fit_config, channel, range_index):
         """
@@ -678,6 +679,9 @@ class OdmrLogic(LogicBase):
         Nach erfolgreichem Fit wird eine adaptive Verfeinerung des
         Frequenzbereichs (im Drop-Bereich) durchgeführt.
         """
+        # Neuer, besonderer Log-Eintrag:
+        self.log.info("SPECIAL_LOG: do_fit triggered with fit_config='{}', channel='{}', range_index={}".format(fit_config, channel, range_index))
+
         if fit_config != 'No Fit' and fit_config not in self._fit_config_model.configuration_names:
             self.log.error(f'Unknown fit configuration "{fit_config}" encountered.')
             return
@@ -699,6 +703,7 @@ class OdmrLogic(LogicBase):
             self._fit_results[channel][range_index] = None
 
         self.sigFitUpdated.emit(self._fit_results[channel][range_index], channel, range_index)
+
 
     def _adaptive_update_frequency_range(self, channel, range_index, fit_result):
         """
