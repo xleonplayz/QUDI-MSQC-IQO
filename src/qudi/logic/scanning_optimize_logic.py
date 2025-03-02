@@ -404,36 +404,88 @@ class ScanningOptimizeLogic(LogicBase):
                 self.sigOptimizeStateChanged.emit(False, dict(), None)
 
     def _get_pos_from_2d_gauss_fit(self, xy, data):
-        model = Gaussian2D()
+        """
+        Führt ein polynomiales 2D-Fitting (Quadratikmodell) durch und gibt die
+        Peakposition zurück.
+        
+        Modell:
+            f(x, y) = A*x^2 + B*y^2 + C*x*y + D*x + E*y + F
 
+        Ableitungen:
+            ∂f/∂x = 2*A*x + C*y + D = 0
+            ∂f/∂y = 2*B*y + C*x + E = 0
+
+        Lösen des linearen Gleichungssystems liefert die Peakposition.
+        Bei einem Fehler wird als Fallback die geometrische Mitte zurückgegeben.
+        """
         try:
-            fit_result = model.fit(data, x=xy, **model.estimate_peak(data, xy))
-        except:
+            x, y = xy[0], xy[1]
+            # Daten in 1D-Arrays umformen
+            x_flat = x.ravel()
+            y_flat = y.ravel()
+            data_flat = data.ravel()
+
+            # Designmatrix: Spalten [x^2, y^2, x*y, x, y, 1]
+            M = np.column_stack([x_flat**2, y_flat**2, x_flat * y_flat, x_flat, y_flat, np.ones_like(x_flat)])
+            coeffs, _, _, _ = np.linalg.lstsq(M, data_flat, rcond=None)
+            A, B, C, D, E, F = coeffs
+
+            # Ableitungsgleichungssystem:
+            # [2A   C ] [x] = [-D]
+            # [ C  2B] [y]   [-E]
+            M_deriv = np.array([[2 * A, C],
+                                [C, 2 * B]])
+            rhs = np.array([-D, -E])
+            try:
+                center = np.linalg.solve(M_deriv, rhs)
+            except np.linalg.LinAlgError:
+                # Fallback: geometrische Mitte
+                x_min, x_max = x.min(), x.max()
+                y_min, y_max = y.min(), y.max()
+                center = np.array([(x_max + x_min) / 2, (y_max + y_min) / 2])
+
+            # Berechne das angepasste 2D-Polynom (als "fit data")
+            fit_data = M.dot(coeffs).reshape(x.shape)
+            return (center[0], center[1]), fit_data, coeffs
+
+        except Exception:
             x_min, x_max = xy[0].min(), xy[0].max()
             y_min, y_max = xy[1].min(), xy[1].max()
-            x_middle = (x_max - x_min) / 2 + x_min
-            y_middle = (y_max - y_min) / 2 + y_min
-            self.log.exception('2D Gaussian fit unsuccessful.')
-            return (x_middle, y_middle), None, None
+            center = ((x_min + x_max) / 2, (y_min + y_max) / 2)
+            self.log.exception("2D polynomial fit unsuccessful.")
+            return center, None, None
 
-        return (
-            (fit_result.best_values['center_x'], fit_result.best_values['center_y']),
-            fit_result.best_fit.reshape(xy[0].shape),
-            fit_result,
-        )
 
     def _get_pos_from_1d_gauss_fit(self, x, data):
-        model = Gaussian()
+        """
+        Führt ein polynomiales 1D-Fitting (Quadratikmodell) durch und gibt die
+        Peakposition zurück.
 
+        Modell:
+            f(x) = a*x^2 + b*x + c
+
+        Der Peak liegt bei x_peak = -b/(2a), sofern a ≠ 0.
+        Bei einem Fehler wird als Fallback der Mittelwert des betrachteten Bereichs zurückgegeben.
+        """
         try:
-            fit_result = model.fit(data, x=x, **model.estimate_peak(data, x))
-        except:
-            x_min, x_max = x.min(), x.max()
-            middle = (x_max - x_min) / 2 + x_min
-            self.log.exception('1D Gaussian fit unsuccessful.')
-            return (middle,), None, None
+            # quadratischer Fit an die Daten
+            coeffs = np.polyfit(x, data, 2)
+            a, b, c = coeffs
+            # Berechnung der Peakposition: x_peak = -b/(2a)
+            if a != 0:
+                center = -b / (2 * a)
+            else:
+                center = (x.min() + x.max()) / 2
 
-        return (fit_result.best_values['center'],), fit_result.best_fit, fit_result
+            fit_data = np.polyval(coeffs, x)
+            return (center,), fit_data, coeffs
+
+        except Exception:
+            x_min, x_max = x.min(), x.max()
+            center = (x_min + x_max) / 2
+            self.log.exception("1D polynomial fit unsuccessful.")
+            return (center,), None, None
+
 
     def _check_scan_settings(self):
         """Basic check of scan settings for all axes."""

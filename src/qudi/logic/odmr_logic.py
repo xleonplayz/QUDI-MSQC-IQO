@@ -110,20 +110,19 @@ class OdmrLogic(LogicBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._threadlock = RecursiveMutex()
-
         self._elapsed_time = 0.0
         self._elapsed_sweeps = 0
         self.__estimated_lines = 0
         self._start_time = 0.0
         self._fit_container = None
         self._fit_config_model = None
-
         self._raw_data = None
         self._signal_data = None
         self._frequency_data = None
         self._fit_results = None
+        self._is_second_scan = False  # Neue Variable, um den zweiten Scan zu kennzeichnen.
+
 
     def on_activate(self):
         """
@@ -486,22 +485,276 @@ class OdmrLogic(LogicBase):
                     microwave.module_state() != 'idle' and not microwave.is_scanning
                 )
 
+    # Neue Signaldeklaration (auf Klassenebene, zusammen mit den anderen Signalen)
+    sigScanFinished = QtCore.Signal()
+
+    @QtCore.Slot()
+    def stop_odmr_scan(self):
+        """ Stoppt den ODMR-Scan und signalisiert, dass der Scan beendet wurde. """
+        with self._threadlock:
+            if self.module_state() == 'locked':
+                self._microwave().off()
+                self.module_state.unlock()
+            self.sigScanStateUpdated.emit(False)
+            # Signal, dass der Scan fertig ist
+            self.sigScanFinished.emit()
+
     @QtCore.Slot(bool, bool)
     def toggle_odmr_scan(self, start, resume):
         """
+        Startet (oder stoppt) den ODMR-Scan.
+        Wenn start=True, wird der Scan gestartet und nach Beendigung automatisch ein zweiter Scan initiiert.
         """
         if start:
-            if resume:
-                self.continue_odmr_scan()
-            else:
-                self.start_odmr_scan()
+            # Oberfläche sperren
+            self.sigScanStateUpdated.emit(True)
+            # Scan-Wiederholungs-Zähler zurücksetzen
+            self._scan_counter = 0
+            # Verbinde das finished-Signal mit dem Slot, der den nächsten Scan startet
+            self.sigScanFinished.connect(self._on_scan_finished)
+            # Ersten Scan starten
+            self.start_odmr_scan()
         else:
             self.stop_odmr_scan()
+            self.sigScanStateUpdated.emit(False)
+            try:
+                self.sigScanFinished.disconnect(self._on_scan_finished)
+            except Exception:
+                pass
+
+    def _on_scan_finished(self):
+        self._scan_counter += 1
+        if self._scan_counter == 1:
+            # Nach dem ersten Scan: Frequenzbereich verfeinern
+            for i in range(len(self._scan_frequency_ranges)):
+                new_freq = self.refine_frequency_range_v4(i)
+                self._frequency_data[i] = new_freq
+            self._is_second_scan = True  # Kennzeichne, dass der 2. Scan gestartet wird
+            self.start_odmr_scan()
+        else:
+            self.sigScanFinished.disconnect(self._on_scan_finished)
+            self._scan_counter = 0
+            self._is_second_scan = False
+
+
+
+
+    def refine_frequency_range_v2(self, range_index, drop_threshold_factor=0.5, concentration_power=3):
+        """
+        Verfeinert den Frequenzbereich für den zweiten Scan. Dabei werden:
+        - 50% der Punkte gleichmäßig über den gesamten Frequenzbereich verteilt,
+        - 50% der Punkte in dem ermittelten Drop-Bereich konzentriert, sodass
+            in den tiefsten (anomal tiefen) Punkten mehr Messpunkte liegen.
+        
+        Parameter:
+        range_index: Index des Frequenzbereichs (entspricht einem Element in self._scan_frequency_ranges).
+        drop_threshold_factor: Faktor, um den Drop-Bereich relativ zur Differenz zwischen Basislinie 
+                                und Minimalwert zu definieren. Beispielsweise bedeutet 0.5,
+                                dass als Drop-Bereich alle Punkte gelten, deren Signal
+                                unter (Basislinie - 0.5*(Basislinie - Minimum)) liegt.
+        concentration_power: Exponent, der bestimmt, wie stark die Punkte im Drop-Bereich konzentriert werden.
+                            Höhere Werte bewirken, dass sich die Punkte stärker um den tiefsten Punkt sammeln.
+        
+        Rückgabe:
+        new_freq: Der neu berechnete Frequenzarray für diesen Bereich.
+        """
+        # Ursprünglicher Frequenzbereich und zugehöriges Signal (hier exemplarisch für den ersten Kanal)
+        freq = self._frequency_data[range_index]
+        channel = list(self._signal_data.keys())[0]
+        signal = self._signal_data[channel][range_index]
+        
+        total_points = len(freq)
+        n_uniform = total_points // 2  # 50% gleichmäßig verteilt
+        n_drop = total_points - n_uniform  # restliche 50% für den Drop-Bereich
+
+        # Bestimme Basislinie (z. B. Median) und den minimalen Signalwert
+        baseline = np.median(signal)
+        min_val = np.min(signal)
+        min_index = np.argmin(signal)
+        
+        # Definiere einen Schwellenwert, um den Drop-Bereich zu identifizieren
+        threshold = baseline - drop_threshold_factor * (baseline - min_val)
+        
+        # Finde Indizes, bei denen das Signal unter dem Schwellenwert liegt
+        drop_indices = np.where(signal < threshold)[0]
+        if len(drop_indices) == 0:
+            # Kein signifikanter Drop erkannt – gib den ursprünglichen Frequenzbereich zurück
+            return freq
+
+        # Bestimme den Drop-Bereich: von der ersten bis zur letzten Stelle, an der das Signal unter dem Schwellenwert liegt
+        drop_start_idx = drop_indices[0]
+        drop_end_idx = drop_indices[-1]
+        drop_start_freq = freq[drop_start_idx]
+        drop_end_freq = freq[drop_end_idx]
+        
+        # Aufteilen des Drop-Bereichs in zwei Segmente: links (bis zum Minimalpunkt) und rechts (ab Minimalpunkt)
+        n_drop_left = n_drop // 2
+        n_drop_right = n_drop - n_drop_left
+        
+        # Linker Teil: von drop_start_freq bis zum minimalen Punkt
+        min_freq = freq[min_index]
+        x_left = np.linspace(0, 1, n_drop_left)
+        # Durch Anwenden einer Potenzfunktion werden die Punkte ungleich verteilt – höhere Konzentration nahe dem Minimum
+        left_transformed = x_left**concentration_power
+        drop_left = drop_start_freq + (min_freq - drop_start_freq) * left_transformed
+
+        # Rechter Teil: von minimalem Punkt bis drop_end_freq
+        x_right = np.linspace(0, 1, n_drop_right)
+        right_transformed = x_right**concentration_power
+        drop_right = min_freq + (drop_end_freq - min_freq) * right_transformed
+
+        # Kombiniere beide Teile zu einem Drop-Raster
+        drop_grid = np.concatenate((drop_left, drop_right))
+        
+        # Erzeuge ein gleichmäßig verteiltes Raster über den gesamten Frequenzbereich
+        uniform_grid = np.linspace(freq[0], freq[-1], n_uniform)
+        
+        # Kombiniere die Raster und sortiere sie
+        new_freq = np.sort(np.concatenate((uniform_grid, drop_grid)))
+        
+        # Optional: Falls die Gesamtzahl der Punkte nicht exakt total_points beträgt,
+        # kann hier noch eine Anpassung erfolgen (z. B. durch Interpolation oder Resampling).
+        if len(new_freq) > total_points:
+            indices = np.linspace(0, len(new_freq) - 1, total_points).astype(int)
+            new_freq = new_freq[indices]
+        elif len(new_freq) < total_points:
+            new_freq = np.linspace(new_freq[0], new_freq[-1], total_points)
+        
+        return new_freq
+
+
+
+    def refine_frequency_range_v3(self, range_index, drop_fraction=0.15, drop_width_fraction=0.01):
+        """
+        Verfeinert den Frequenzbereich, indem:
+        - 85% der Punkte gleichmäßig über den gesamten Bereich verteilt werden
+        - 15% der Punkte in einem engen Intervall um den Tiefpunkt (minimaler Signalwert) konzentriert werden
+
+        Parameter:
+        range_index: Index des Frequenzbereichs (entspricht einem Element in self._scan_frequency_ranges)
+        drop_fraction: Anteil der Gesamtpunkte, die im Drop-Bereich konzentriert werden (Standard 15%)
+        drop_width_fraction: Breite des Drop-Bereichs als Anteil des gesamten Frequenzbereichs (Standard 1%)
+
+        Rückgabe:
+        new_freq: Der verfeinerte Frequenzarray
+        """
+        # Ursprünglicher Frequenzbereich
+        freq = self._frequency_data[range_index]
+        # Für das Signal nehmen wir exemplarisch den ersten Kanal
+        channel = list(self._signal_data.keys())[0]
+        signal = self._signal_data[channel][range_index]
+        
+        total_points = len(freq)
+        N_drop = int(np.round(drop_fraction * total_points))
+        N_uniform = total_points - N_drop
+
+        # Gleichmäßig verteiltes Raster über den gesamten Frequenzbereich (85% der Punkte)
+        uniform_grid = np.linspace(freq[0], freq[-1], N_uniform)
+
+        # Bestimme den Tiefpunkt (minimaler Signalwert) im Messsignal
+        min_index = np.argmin(signal)
+        min_freq = freq[min_index]
+
+        # Berechne die Breite des Drop-Bereichs als ein Anteil des Gesamtbereichs
+        total_range = freq[-1] - freq[0]
+        drop_width = drop_width_fraction * total_range
+        # Definiere den Dropbereich (achte darauf, dass wir innerhalb des Gesamtbereichs bleiben)
+        drop_start = max(freq[0], min_freq - drop_width / 2)
+        drop_end = min(freq[-1], min_freq + drop_width / 2)
+
+        # Erzeuge ein dichtes Raster im Dropbereich (15% der Punkte)
+        drop_grid = np.linspace(drop_start, drop_end, N_drop)
+
+        # Kombiniere beide Raster und sortiere sie
+        new_freq = np.sort(np.concatenate((uniform_grid, drop_grid)))
+
+        # Sollte es aufgrund von Rundungen oder Überschneidungen nicht genau total_points geben,
+        # erzwingen wir hier ein finales Raster mit exakt total_points Elementen.
+        if len(new_freq) != total_points:
+            new_freq = np.linspace(new_freq[0], new_freq[-1], total_points)
+        
+        return new_freq
+
+    def refine_frequency_range_v4(self, range_index, anomaly_threshold_factor=0.5):
+        """
+        Verfeinert den Frequenzbereich, indem:
+        - 50% der Punkte gleichmäßig außerhalb des Anomaliebereichs verteilt werden und
+        - 50% der Punkte gleichmäßig innerhalb des Anomaliebereichs gesetzt werden.
+        
+        Der Anomaliebereich wird anhand des Signals identifiziert:
+        - Es wird eine Basislinie (z. B. der Median) ermittelt und der minimale Signalwert bestimmt.
+        - Ein Schwellenwert wird definiert als:
+                threshold = baseline - anomaly_threshold_factor * (baseline - min_val)
+        - Alle Frequenzpunkte, bei denen das Signal unterhalb dieses Schwellenwerts liegt, gelten als Teil des Anomaliebereichs.
+        
+        Falls keine Anomalie gefunden wird, wird das ursprüngliche Frequenzraster zurückgegeben.
+        
+        Parameter:
+        range_index: Index des Frequenzbereichs in self._frequency_data.
+        anomaly_threshold_factor: Faktor zur Bestimmung des Schwellenwerts (Standard: 0.5).
+        
+        Rückgabe:
+        new_freq: Das neu berechnete Frequenzarray.
+        """
+        # Ursprünglicher Frequenzbereich
+        freq = self._frequency_data[range_index]
+        # Beispielhaft nehmen wir das Signal des ersten Kanals
+        channel = list(self._signal_data.keys())[0]
+        signal = self._signal_data[channel][range_index]
+        
+        N_total = len(freq)
+        # 50% der Punkte für den Anomaliebereich und 50% für den Rest
+        N_anomaly = int(np.round(0.5 * N_total))
+        N_non_anomaly = N_total - N_anomaly
+
+        # Basislinie (Median) und Minimalwert des Signals ermitteln
+        baseline = np.median(signal)
+        min_val = np.min(signal)
+        
+        # Schwellenwert definieren: Punkte unterhalb dieses Wertes gelten als Anomalie
+        threshold = baseline - anomaly_threshold_factor * (baseline - min_val)
+        
+        # Bestimme die Indizes, an denen das Signal unterhalb des Schwellenwerts liegt
+        anomaly_indices = np.where(signal < threshold)[0]
+        if len(anomaly_indices) == 0:
+            # Falls keine Anomalie gefunden wird, gebe das ursprüngliche Raster zurück
+            return freq
+        
+        # Der Anomaliebereich wird von der ersten bis zur letzten Stelle, an der das Signal unter dem Schwellenwert liegt, definiert
+        anomaly_start = freq[anomaly_indices[0]]
+        anomaly_end = freq[anomaly_indices[-1]]
+        
+        # Erzeuge ein Raster mit N_anomaly Punkten, gleichmäßig im Anomaliebereich
+        anomaly_grid = np.linspace(anomaly_start, anomaly_end, N_anomaly)
+        
+        # Erzeuge das Raster für den nicht-anomalen Bereich, der aus zwei Intervallen besteht:
+        #   Intervall 1: [freq[0], anomaly_start]
+        #   Intervall 2: [anomaly_end, freq[-1]]
+        L1 = anomaly_start - freq[0]
+        L2 = freq[-1] - anomaly_end
+        L_total = L1 + L2
+        if L_total <= 0:
+            new_freq = anomaly_grid
+        else:
+            # Punkteverteilung proportional zur Länge der beiden Intervalle
+            N1 = int(np.round(N_non_anomaly * (L1 / L_total)))
+            N2 = N_non_anomaly - N1
+            grid1 = np.linspace(freq[0], anomaly_start, N1, endpoint=False) if N1 > 0 else np.array([])
+            grid2 = np.linspace(anomaly_end, freq[-1], N2, endpoint=True) if N2 > 0 else np.array([])
+            non_anomaly_grid = np.concatenate((grid1, grid2))
+            # Kombiniere beide Raster und sortiere sie
+            new_freq = np.sort(np.concatenate((non_anomaly_grid, anomaly_grid)))
+        
+        # Stelle sicher, dass new_freq genau N_total Punkte hat
+        if len(new_freq) != N_total:
+            new_freq = np.linspace(new_freq[0], new_freq[-1], N_total)
+        
+        return new_freq
+
+
 
     @QtCore.Slot()
     def start_odmr_scan(self):
-        """ Starting an ODMR scan.
-        """
         with self._threadlock:
             if self.module_state() != 'idle':
                 self.log.error('Can not start ODMR scan. Measurement is already running.')
@@ -514,15 +767,11 @@ class OdmrLogic(LogicBase):
             self.toggle_cw_output(False)
             self.module_state.lock()
 
-            # Set up hardware
             try:
                 sample_rate = self._oversampling_factor * self._data_rate
-                # switch scan mode if necessary
-                if self._default_scan_mode != SamplingOutputMode.JUMP_LIST and len(
-                        self._scan_frequency_ranges) > 1:
+                if self._default_scan_mode != SamplingOutputMode.JUMP_LIST and len(self._scan_frequency_ranges) > 1:
                     mode = SamplingOutputMode.JUMP_LIST
-                    self.log.info('Multiple ODMR scan ranges set up. Trying to switch scanner to '
-                                  'output mode "JUMP_LIST".')
+                    self.log.info('Multiple ODMR scan ranges set up. Trying to switch scanner to output mode "JUMP_LIST".')
                 else:
                     mode = self._default_scan_mode
                 if mode == SamplingOutputMode.JUMP_LIST:
@@ -534,10 +783,8 @@ class OdmrLogic(LogicBase):
                     frequencies = self._scan_frequency_ranges[0]
                     samples = frequencies[-1]
 
-                # Set up data acquisition device
                 sampler.set_sample_rate(sample_rate)
                 sampler.set_frame_size(samples)
-                # Set up microwave scan and start it
                 microwave.configure_scan(self._scan_power, frequencies, mode, sample_rate)
                 microwave.start_scan()
             except:
@@ -550,11 +797,15 @@ class OdmrLogic(LogicBase):
             self._elapsed_sweeps = 0
             self._elapsed_time = 0.0
             self.sigElapsedUpdated.emit(self._elapsed_time, self._elapsed_sweeps)
-            self._initialize_odmr_data()
+            # Nur im ersten Scan wird _initialize_odmr_data() aufgerufen,
+            # damit im zweiten Scan das verfeinerte Frequenzraster erhalten bleibt.
+            if not self._is_second_scan:
+                self._initialize_odmr_data()
             self.sigScanDataUpdated.emit()
             self.sigScanStateUpdated.emit(True)
             self._start_time = time.time()
             self._sigNextLine.emit()
+
 
     def clear_all_fits(self):
         for channel, range_data in self._raw_data.items():
@@ -581,17 +832,7 @@ class OdmrLogic(LogicBase):
             self._start_time = time.time() - self._elapsed_time
             self._sigNextLine.emit()
 
-    @QtCore.Slot()
-    def stop_odmr_scan(self):
-        """ Stop the ODMR scan.
 
-        @return int: error code (0:OK, -1:error)
-        """
-        with self._threadlock:
-            if self.module_state() == 'locked':
-                self._microwave().off()
-                self.module_state.unlock()
-            self.sigScanStateUpdated.emit(False)
 
     @QtCore.Slot()
     def clear_odmr_data(self):
@@ -671,17 +912,11 @@ class OdmrLogic(LogicBase):
                 self._sigNextLine.emit()
             return
 
-
     @QtCore.Slot(str, str, int)
     def do_fit(self, fit_config, channel, range_index):
         """
-        Führt den aktuellen Fit auf den Messdaten aus.
-        Nach erfolgreichem Fit wird eine adaptive Verfeinerung des
-        Frequenzbereichs (im Drop-Bereich) durchgeführt.
+        Execute the currently configured fit on the measurement data. Optionally on passed data
         """
-        # Besondere Log-Ausgabe, um den Aufruf zu markieren:
-        self.log.info("SPECIAL_LOG: do_fit triggered with fit_config='{}', channel='{}', range_index={}".format(fit_config, channel, range_index))
-
         if fit_config != 'No Fit' and fit_config not in self._fit_config_model.configuration_names:
             self.log.error(f'Unknown fit configuration "{fit_config}" encountered.')
             return
@@ -691,58 +926,15 @@ class OdmrLogic(LogicBase):
 
         try:
             fit_config, fit_result = self._fit_container.fit_data(fit_config, x_data, y_data)
-        except Exception as e:
+        except:
             self.log.exception('Data fitting failed:')
             return
 
         if fit_result is not None:
             self._fit_results[channel][range_index] = (fit_config, fit_result)
-            # Adaptive Verfeinerung des Frequenzbereichs, um den Dip (Drop) genauer abzutasten:
-            self._adaptive_update_frequency_range(channel, range_index, fit_result)
         else:
             self._fit_results[channel][range_index] = None
-
         self.sigFitUpdated.emit(self._fit_results[channel][range_index], channel, range_index)
-
-    def _adaptive_update_frequency_range(self, channel, range_index, fit_result):
-        """
-        Passt adaptiv den Frequenzbereich an, basierend auf den Fit-Ergebnissen,
-        um im Drop-Bereich (Resonanz) eine höhere Messpunktdichte zu erreichen.
-        
-        Erwartet wird, dass 'fit_result.parameters' ein Dictionary enthält,
-        in dem mindestens 'center' (Dip-Mittelpunkt) und 'sigma' (Breite des Dips)
-        definiert sind.
-        
-        Zur deutlicheren Darstellung wird der neue Frequenzbereich:
-        - auf ±1·sigma um den Dip-Mittelpunkt gesetzt,
-        - die Anzahl der Messpunkte wird um den Faktor 3 erhöht.
-        """
-        try:
-            params = fit_result.parameters
-            dip_center = params.get('center', None)
-            dip_width = params.get('sigma', None)
-            if dip_center is None or dip_width is None:
-                self.log.warning("SPECIAL_LOG: Fit result missing 'center' and/or 'sigma'. Skipping adaptive update.")
-                return
-
-            # Für einen deutlichen Unterschied: setze den neuen Bereich auf ±1·sigma
-            new_start = dip_center - dip_width
-            new_stop = dip_center + dip_width
-
-            # Verdopple nicht mehr, sondern verdreifache die Anzahl der Punkte:
-            current_points = self._scan_frequency_ranges[range_index][2]
-            new_points = current_points * 3
-
-            self.log.info("SPECIAL_LOG: Adaptive update applied. Changing frequency range from {} to ({}, {}, {}).".format(
-                self._scan_frequency_ranges[range_index], new_start, new_stop, new_points
-            ))
-
-            # Aktualisiere den Frequenzbereich und das Frequenzarray
-            self._scan_frequency_ranges[range_index] = (new_start, new_stop, new_points)
-            self._frequency_data[range_index] = np.linspace(new_start, new_stop, new_points)
-        except Exception as e:
-            self.log.exception("SPECIAL_LOG: Error in adaptive update:")
-
 
     def _get_metadata(self):
         metadata = {'Microwave CW Power (dBm)': self._cw_power,
