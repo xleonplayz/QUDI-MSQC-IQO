@@ -1,0 +1,57 @@
+# Example configuration for integrating the NV Center Simulator with Qudi
+
+# This is a sample configuration file that can be used to connect the NV Center Simulator
+# to the Qudi framework. Copy the relevant sections to your Qudi config file.
+
+gui:
+    tray:
+        module.Class: 'tray.TrayIcon'
+    man:
+        module.Class: 'manager.managergui.ManagerGui'
+    scanner:
+        module.Class: 'scanner.scannergui.ScannerGui'
+        connect:
+            scanning_logic: scanning_probe_logic
+    laser:
+        module.Class: 'laser.laser_gui.LaserGui'
+        connect:
+            laser_logic: laser_logic
+    odmr:
+        module.Class: 'odmr.odmrgui.ODMRGui'
+        connect:
+            odmrlogic1: odmr_logic
+
+hardware:
+    mw_source_simulator:
+        module.Class: 'nv_simulator.hardware.microwave_simulator.MicrowaveSimulator'
+    laser_simulator:
+        module.Class: 'nv_simulator.hardware.laser_simulator.LaserSimulator'
+    scanning_probe_simulator:
+        module.Class: 'nv_simulator.hardware.scanning_probe_simulator.ScanningProbeSimulator'
+        options:
+            max_scanner_update_rate: 20  # Hz
+            external_clock_rate: 10  # Hz
+            backscan_configurable: True
+            position_ranges:
+                x: [-50, 50]  # μm
+                y: [-50, 50]  # μm
+                z: [-25, 25]  # μm
+            spot_number: 15
+            nv_density: 0.01  # NV centers per μm²
+
+logic:
+    laser_logic:
+        module.Class: 'laser_logic.LaserLogic'
+        connect:
+            laser: laser_simulator
+    scanning_probe_logic:
+        module.Class: 'scanning_probe_logic.ScanningProbeLogic'
+        connect:
+            scanner: scanning_probe_simulator
+    odmr_logic:
+        module.Class: 'odmr_logic.ODMRLogic'
+        connect:
+            microwave1: mw_source_simulator
+            fitlogic: fit_logic
+    fit_logic:
+        module.Class: 'fit_logic.FitLogic'
